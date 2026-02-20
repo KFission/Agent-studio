@@ -344,6 +344,145 @@ class GCPKnowledgeBaseService:
             "error_samples": error_samples,
         }
 
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    def search_documents(
+        self,
+        datastore_id: str,
+        query: str,
+        page_size: int = 10,
+    ) -> list:
+        """
+        Search documents in the Vertex AI Discovery Engine datastore.
+
+        Returns a list of dicts with keys: document, page, score, text.
+        """
+        client_kwargs = {}
+        if self._credentials:
+            client_kwargs["credentials"] = self._credentials
+
+        search_client = discoveryengine.SearchServiceClient(**client_kwargs)
+
+        serving_config = (
+            f"projects/{self.project_id}/locations/{self.location}"
+            f"/collections/default_collection/dataStores/{datastore_id}"
+            f"/servingConfigs/default_config"
+        )
+
+        request = discoveryengine.SearchRequest(
+            serving_config=serving_config,
+            query=query,
+            page_size=page_size,
+            content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
+                extractive_content_spec=discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
+                    max_extractive_segment_count=1,
+                    return_extractive_segment_score=True,
+                ),
+                snippet_spec=discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
+                    return_snippet=True,
+                    max_snippet_count=2,
+                ),
+            ),
+            query_expansion_spec=discoveryengine.SearchRequest.QueryExpansionSpec(
+                condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO,
+            ),
+            spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
+                mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO,
+            ),
+        )
+
+        response = search_client.search(request=request)
+
+        results = []
+        for result in response.results:
+            doc = result.document
+            derived = {}
+            if hasattr(doc, "derived_struct_data") and doc.derived_struct_data:
+                derived = dict(doc.derived_struct_data)
+
+            # Document name / URI
+            link = derived.get("link", "")
+            if hasattr(link, "string_value"):
+                link = link.string_value
+            doc_name = str(link).split("/")[-1] if link else (doc.id or "Unknown")
+
+            # Page identifier
+            page_val = derived.get("pageIdentifier", "1")
+            if hasattr(page_val, "string_value"):
+                page_val = page_val.string_value
+            try:
+                page = int(str(page_val))
+            except (ValueError, TypeError):
+                page = 1
+
+            # Extractive segment → text + score
+            text = ""
+            score = 0.0
+            segments = derived.get("extractive_segments", [])
+            if segments:
+                seg = segments[0]
+                if hasattr(seg, "fields"):
+                    fields = dict(seg.fields)
+                    text = fields.get("content", seg).string_value if hasattr(fields.get("content", ""), "string_value") else str(fields.get("content", ""))
+                    score_val = fields.get("relevanceScore", None)
+                    if score_val is not None and hasattr(score_val, "number_value"):
+                        score = score_val.number_value
+
+            # Fallback to snippets
+            if not text:
+                snippets = derived.get("snippets", [])
+                if snippets:
+                    snip = snippets[0]
+                    if hasattr(snip, "fields"):
+                        fields = dict(snip.fields)
+                        text = fields.get("snippet", snip).string_value if hasattr(fields.get("snippet", ""), "string_value") else str(fields.get("snippet", ""))
+
+            results.append({
+                "document": doc_name,
+                "page": page,
+                "score": round(float(score), 4),
+                "text": text,
+            })
+
+        return results
+
+    # ── Document Content Sampling (for test data generation) ──────────────────
+
+    def get_document_content_samples(
+        self,
+        bucket_name: str,
+        max_files: int = 3,
+        max_bytes_per_file: int = 8000,
+    ) -> list:
+        """
+        Download a text sample from each document in the GCS bucket.
+        Binary formats (PDF, DOCX, PPTX, XLSX) are listed by name only —
+        the LLM uses the filename as a hint about content.
+        """
+        TEXT_EXTENSIONS = {".txt", ".md", ".html", ".csv", ".json"}
+
+        bucket = self._storage_client.bucket(bucket_name)
+        blobs = list(bucket.list_blobs())
+
+        samples = []
+        for blob in blobs[:max_files]:
+            ext = ("." + blob.name.rsplit(".", 1)[-1].lower()) if "." in blob.name else ""
+            content = ""
+            if ext in TEXT_EXTENSIONS:
+                try:
+                    raw = blob.download_as_bytes(end=max_bytes_per_file)
+                    content = raw.decode("utf-8", errors="replace")
+                except Exception as e:
+                    logger.warning(f"Could not read {blob.name}: {e}")
+            samples.append({
+                "name": blob.name,
+                "extension": ext.lstrip("."),
+                "size_bytes": blob.size or 0,
+                "content": content,
+            })
+
+        return samples
+
     # ── Full Knowledge Base Creation ──────────────────────────────────────────
 
     def create_knowledge_base(

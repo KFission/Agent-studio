@@ -280,15 +280,33 @@ export default function KnowledgeBasesPage() {
   const runTest = async (kbId) => {
     if (!testQuery.trim()) return;
     setActionLoading("test");
-    const r = await apiFetch(`${API}/knowledge-bases/${kbId}/test`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: testQuery, top_k: topK }) });
-    setTestResults(await r.json());
+    try {
+      const r = await apiFetch(`${API}/knowledge-bases/${kbId}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: testQuery, top_k: topK }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      setTestResults(await r.json());
+    } catch (e) { console.error("Search failed:", e); }
     setActionLoading("");
   };
 
   const generateTestData = async (kbId) => {
     setActionLoading("generate");
-    const r = await apiFetch(`${API}/knowledge-bases/${kbId}/generate-test-data`, { method: "POST" });
-    setTestData(await r.json());
+    try {
+      const r = await apiFetch(`${API}/knowledge-bases/${kbId}/generate-test-data`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_id: evalModel,
+          num_questions: 5,
+          prompt_template: prompts.testCaseGeneration,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      setTestData(await r.json());
+    } catch (e) { console.error("Generate test data failed:", e); }
     setActionLoading("");
   };
 
