@@ -690,11 +690,17 @@ import asyncio as _asyncio
 _SLOW_PATH_PREFIXES = ("/chat/", "/playground/", "/pipelines/", "/prompts/improve", "/agents/invoke")
 _DEFAULT_TIMEOUT = 120  # seconds
 _SLOW_TIMEOUT = 300     # seconds for LLM / pipeline endpoints
+# Skip asyncio.wait_for entirely for these paths — wrapping multipart uploads in
+# wait_for is a known Starlette/BaseHTTPMiddleware bug that can corrupt the request
+# body stream or cancel mid-transfer, causing silent 504s on large file uploads.
+_NO_TIMEOUT_PATHS = ("/knowledge-bases/",)
 
 
 class TimeoutMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+        if any(path.startswith(p) for p in _NO_TIMEOUT_PATHS):
+            return await call_next(request)
         timeout = _SLOW_TIMEOUT if any(path.startswith(p) for p in _SLOW_PATH_PREFIXES) else _DEFAULT_TIMEOUT
         try:
             return await _asyncio.wait_for(call_next(request), timeout=timeout)

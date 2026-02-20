@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.engine import get_db_session
-from backend.db.models import KnowledgeBaseModel, FileUploadModel
+from backend.db.models import KnowledgeBaseModel, FileUploadModel, ProviderCredentialModel
 from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -72,21 +72,55 @@ def _kb_to_frontend_response(kb: KnowledgeBaseModel) -> dict:
     }
 
 
-def _get_gcp_service():
-    """Lazily create the GCP Knowledge Base service."""
-    from backend.knowledge_base.gcp_service import GCPKnowledgeBaseService
+async def _get_gcp_service(session: AsyncSession):
+    """
+    Create the GCP Knowledge Base service.
 
-    sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    Credential resolution order:
+    1. GOOGLE_APPLICATION_CREDENTIALS env var / settings path
+    2. Active 'google' provider credential stored in the DB
+    3. Application Default Credentials (ADC) — e.g. workload identity on GKE
+    """
+    from backend.knowledge_base.gcp_service import GCPKnowledgeBaseService
+    from backend.db.credential_store import _decrypt
+
     sa_info = None
+
+    # 1. Env var / settings path
+    sa_path = settings.google_application_credentials or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
     if sa_path and os.path.exists(sa_path):
         with open(sa_path) as f:
             sa_info = json.load(f)
 
+    # 2. DB-stored credential (encrypted service account JSON uploaded via UI)
+    if not sa_info:
+        try:
+            result = await session.execute(
+                select(ProviderCredentialModel)
+                .where(ProviderCredentialModel.provider == "google")
+                .where(ProviderCredentialModel.is_active.is_(True))
+                .order_by(ProviderCredentialModel.created_at.desc())
+                .limit(1)
+            )
+            cred_row = result.scalar_one_or_none()
+            if cred_row:
+                sa_info = json.loads(_decrypt(cred_row.credential_blob))
+                logger.info("Using Google credentials from DB credential store")
+        except Exception as e:
+            logger.warning(f"Could not load Google credentials from DB: {e}")
+
+    project_id = (sa_info.get("project_id") if sa_info else None) or settings.gcp_project_id
+
     return GCPKnowledgeBaseService(
-        project_id=settings.gcp_project_id,
+        project_id=project_id,
         location="global",
         service_account_info=sa_info,
     )
+
+
+# Module-level set keeps strong references to background tasks so Python's GC
+# cannot collect them before they finish (asyncio.create_task returns a weak ref).
+_bg_tasks: set = set()
 
 
 # ── Route Registration ────────────────────────────────────────────────────────
@@ -138,7 +172,7 @@ def register_knowledge_base_routes(app: FastAPI):
         3. Grant Discovery Engine service agent access to bucket
         4. Persist to DB
         """
-        gcp_svc = _get_gcp_service()
+        gcp_svc = await _get_gcp_service(session)
 
         # Discovery Engine layout-based chunking supports max 500
         effective_chunk_size = min(req.chunk_size, 500)
@@ -198,7 +232,9 @@ def register_knowledge_base_routes(app: FastAPI):
             except Exception as e:
                 logger.warning(f"Post-creation full sync failed for KB {kb_id_created} (expected if bucket is empty): {e}")
 
-        asyncio.create_task(_post_create_sync())
+        _task = asyncio.create_task(_post_create_sync())
+        _bg_tasks.add(_task)
+        _task.add_done_callback(_bg_tasks.discard)
 
         return _kb_to_frontend_response(kb)
 
@@ -217,7 +253,7 @@ def register_knowledge_base_routes(app: FastAPI):
         if not kb:
             raise HTTPException(404, "Knowledge base not found")
 
-        gcp_svc = _get_gcp_service()
+        gcp_svc = await _get_gcp_service(session)
 
         # Delete GCP resources (best-effort)
         errors = []
@@ -259,7 +295,7 @@ def register_knowledge_base_routes(app: FastAPI):
         file_size = len(content)
 
         # Upload to GCS
-        gcp_svc = _get_gcp_service()
+        gcp_svc = await _get_gcp_service(session)
         try:
             def _upload():
                 bucket = gcp_svc._storage_client.bucket(kb.bucket_name)
@@ -348,7 +384,9 @@ def register_knowledge_base_routes(app: FastAPI):
             except Exception as db_err:
                 logger.error(f"Failed to update file status after sync: {db_err}")
 
-        asyncio.create_task(_background_sync())
+        _task = asyncio.create_task(_background_sync())
+        _bg_tasks.add(_task)
+        _task.add_done_callback(_bg_tasks.discard)
 
         return {
             "success": True,
@@ -411,7 +449,7 @@ def register_knowledge_base_routes(app: FastAPI):
         if not kb:
             raise HTTPException(404, "Knowledge base not found")
 
-        gcp_svc = _get_gcp_service()
+        gcp_svc = await _get_gcp_service(session)
         gcs_uri = f"gs://{kb.bucket_name}/*"
 
         try:
@@ -491,7 +529,7 @@ def register_knowledge_base_routes(app: FastAPI):
             raise HTTPException(404, f"File '{file_id}' not found in knowledge base '{kb_id}'")
 
         # Delete from GCS
-        gcp_svc = _get_gcp_service()
+        gcp_svc = await _get_gcp_service(session)
         try:
             def _delete():
                 bucket = gcp_svc._storage_client.bucket(
@@ -533,6 +571,8 @@ def register_knowledge_base_routes(app: FastAPI):
                 except Exception as e:
                     logger.warning(f"Post-delete full sync failed for KB {kb_id}: {e}")
 
-            asyncio.create_task(_post_delete_sync())
+            _task = asyncio.create_task(_post_delete_sync())
+            _bg_tasks.add(_task)
+            _task.add_done_callback(_bg_tasks.discard)
 
         return {"deleted": file_id, "file_name": file_record.file_name}
