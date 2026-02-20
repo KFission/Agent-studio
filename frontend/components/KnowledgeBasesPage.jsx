@@ -150,12 +150,20 @@ export default function KnowledgeBasesPage() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
-  const load = useCallback(() => {
-    setLoading(true);
+  const load = useCallback((silent = false) => {
+    if (!silent) setLoading(true);
     apiFetch(`${API}/knowledge-bases`).then(r => r.json()).then(d => {
-      setKbs(d.knowledge_bases || []);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+      const kbList = d.knowledge_bases || [];
+      setKbs(kbList);
+      // Keep selected KB data in sync during silent background refreshes
+      if (silent) {
+        setSelected(prev => {
+          if (!prev) return prev;
+          return kbList.find(kb => kb.kb_id === prev.kb_id) || prev;
+        });
+      }
+      if (!silent) setLoading(false);
+    }).catch(() => { if (!silent) setLoading(false); });
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -182,7 +190,7 @@ export default function KnowledgeBasesPage() {
     if (!hasSyncing || !selected?.kb_id) return;
     const interval = setInterval(() => {
       loadFiles(selected.kb_id);
-      load(); // also refresh KB list to update doc counts
+      load(true); // silent — no loading spinner, no scroll-to-top
     }, 5000);
     return () => clearInterval(interval);
   }, [uploadedFiles, selected?.kb_id, loadFiles, load]);
