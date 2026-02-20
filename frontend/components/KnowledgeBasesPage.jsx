@@ -146,6 +146,7 @@ export default function KnowledgeBasesPage() {
   const [uploadedFiles, setUploadedFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null); // { current, total, fileName }
+  const [uploadError, setUploadError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
@@ -172,6 +173,7 @@ export default function KnowledgeBasesPage() {
   useEffect(() => {
     if (selected?.kb_id) loadFiles(selected.kb_id);
     else setUploadedFiles([]);
+    setUploadError(null);
   }, [selected?.kb_id, loadFiles]);
 
   // Auto-poll file list while any file is syncing
@@ -202,6 +204,7 @@ export default function KnowledgeBasesPage() {
   const uploadFiles = async (kbId, files) => {
     if (!files || files.length === 0) return;
     setUploading(true);
+    setUploadError(null);
     setUploadProgress({ current: 0, total: files.length, fileName: "" });
     try {
       for (let i = 0; i < files.length; i++) {
@@ -209,16 +212,23 @@ export default function KnowledgeBasesPage() {
         setUploadProgress({ current: i + 1, total: files.length, fileName: file.name });
         const formData = new FormData();
         formData.append("file", file);
-        await apiFetch(`${API}/knowledge-bases/${kbId}/upload`, {
+        // Do NOT set Content-Type — browser sets it with boundary for multipart
+        const resp = await apiFetch(`${API}/knowledge-bases/${kbId}/upload`, {
           method: "POST",
           body: formData,
-          // Do NOT set Content-Type — browser sets it with boundary for multipart
         });
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => `HTTP ${resp.status}`);
+          throw new Error(errText || `Upload failed with status ${resp.status}`);
+        }
       }
       // Refresh file list and KB data
       loadFiles(kbId);
       load();
-    } catch (e) { console.error("Upload failed:", e); }
+    } catch (e) {
+      console.error("Upload failed:", e);
+      setUploadError(e.message || "Upload failed. Check server logs for details.");
+    }
     setUploading(false);
     setUploadProgress(null);
   };
@@ -512,6 +522,18 @@ export default function KnowledgeBasesPage() {
                   </>
                 )}
               </div>
+
+              {/* Upload error banner */}
+              {uploadError && (
+                <div className="mt-3 flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                  <AlertCircle size={14} className="text-red-500 shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-medium text-red-700">Upload failed</p>
+                    <p className="text-[11px] text-red-500 mt-0.5 break-words">{uploadError}</p>
+                  </div>
+                  <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-600 cursor-pointer shrink-0"><X size={12} /></button>
+                </div>
+              )}
 
               {/* Uploaded files list */}
               {uploadedFiles.length > 0 && (
