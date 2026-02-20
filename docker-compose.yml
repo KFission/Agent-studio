@@ -1,0 +1,241 @@
+# JAI Agent OS — Local Development Docker Compose
+#
+# Full stack:    docker compose up -d --build
+# Just infra:    docker compose up langfuse-db redis -d
+
+services:
+  backend:
+    container_name: jai-backend
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    # Override production CMD: 1 worker + hot reload for local dev
+    command: ["python", "-m", "uvicorn", "backend.api.server:app",
+             "--host", "0.0.0.0", "--port", "8080",
+             "--reload", "--reload-dir", "/app/backend",
+             "--timeout-keep-alive", "30"]
+    ports:
+      - "8080:8080"
+    env_file: .env
+    volumes:
+      - ./backend:/app/backend:cached
+      - ./gcp-service-account.json:/app/gcp-service-account.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-service-account.json
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-gcp-jai-platform-dev}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
+      - REDIS_URL=redis://redis:6379/0
+      # LangGraph Supervisor
+      - LANGGRAPH_URL=${LANGGRAPH_URL:-http://langgraph-supervisor:2024}
+      # Langfuse
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-jai-agent-os}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-jai-agent-os-secret}
+      # Agent Studio DB (shared Postgres with Langfuse)
+      - DATABASE_URL=postgresql+asyncpg://langfuse:langfuse@langfuse-db:5432/agent_studio
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+      # Guardrails AI
+      - GUARDRAILS_API_URL=http://guardrails:8000
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      langgraph-supervisor:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/info"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  guardrails:
+    container_name: jai-guardrails
+    build:
+      context: .
+      dockerfile: Dockerfile.guardrails
+      args:
+        GUARDRAILS_TOKEN: ${GUARDRAILS_TOKEN:-}
+    ports:
+      - "8000:8000"
+    environment:
+      - GUARDRAILS_TOKEN=${GUARDRAILS_TOKEN:-}
+      - LOGLEVEL=INFO
+      - GUARDRAILS_LOG_LEVEL=INFO
+      - PGHOST=langfuse-db
+      - PGPORT=5432
+      - PGUSER=langfuse
+      - PGPASSWORD=langfuse
+      - PGDATABASE=guardrails
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    mem_limit: 512m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+  frontend:
+    container_name: jai-frontend
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ""
+    expose:
+      - "3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    mem_limit: 512m
+    restart: unless-stopped
+
+  nginx-proxy:
+    container_name: jai-nginx
+    image: nginx:alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx-proxy.conf:/etc/nginx/nginx.conf:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - frontend
+    mem_limit: 64m
+    restart: unless-stopped
+
+  redis:
+    container_name: jai-redis
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./.local/redis_data:/data
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── LangGraph Supervisor ────────────────────────────────────────────
+  langgraph-supervisor:
+    build:
+      context: ./servers/langgraph-supervisor
+      dockerfile: Dockerfile
+    container_name: langgraph-supervisor
+    ports:
+      - "2024:2024"
+    env_file: .env
+    environment:
+      # LangSmith tracing
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-default}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY:-}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-true}
+      # LLM API Keys
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GOOGLE_CLOUD_PROJECT=gcp-jai-platform-dev
+      # Google Cloud Service Account for Vertex AI
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-service-account.json
+      # Allow blocking calls (needed for service account credential loading)
+      - BG_JOB_ISOLATED_LOOPS=true
+      # Auth disabled for Agent Studio integration (re-enable later)
+      - DISABLE_AUTH=true
+    volumes:
+      # Mount source code for development (remove for production)
+      - ./servers/langgraph-supervisor/langgraph_supervisor:/app/langgraph_supervisor
+      - ./servers/langgraph-supervisor/langgraph.json:/app/langgraph.json
+      # Mount GCP service account for Vertex AI authentication
+      - ./gcp-service-account.json:/app/gcp-service-account.json:ro
+      # Persist LangGraph data
+      - langgraph-data:/app/.langgraph_api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:2024/ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ── Langfuse Observability Stack ──────────────────────────────────
+  langfuse-db:
+    container_name: jai-postgres
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+    volumes:
+      - ./.local/postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-agent-studio.sh
+    mem_limit: 256m
+    shm_size: 128m
+    # Dev-mode tuning: ~3x faster writes (not for production!)
+    command: [
+      "postgres",
+      "-c", "fsync=off",
+      "-c", "synchronous_commit=off",
+      "-c", "full_page_writes=off",
+      "-c", "max_connections=50",
+      "-c", "shared_buffers=64MB"
+    ]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  langfuse:
+    container_name: jai-langfuse
+    image: langfuse/langfuse:2
+    # Internal-only — accessed by backend via Docker network, not exposed to end users
+    ports:
+      - "3030:3000"  # Admin access only; not user-facing
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3030
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-mysecretkey-change-in-production}
+      SALT: ${LANGFUSE_SALT:-mysalt-change-in-production}
+      TELEMETRY_ENABLED: ${LANGFUSE_TELEMETRY_ENABLED:-true}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      # Auto-initialize project + API keys on first startup (no manual UI setup)
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-jai}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Jaggaer}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-proj-jai}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-JAI Agent OS}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-jai-agent-os}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-jai-agent-os-secret}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@jaggaer.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-admin123}
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/public/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  langfuse_db_data:
+  langgraph-data:

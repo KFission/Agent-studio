@@ -1,0 +1,1 @@
+from .workato_registry import WorkatoConnectorRegistry

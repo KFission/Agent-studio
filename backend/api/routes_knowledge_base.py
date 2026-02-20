@@ -1,0 +1,538 @@
+"""
+Knowledge Base API routes — create/manage knowledge bases backed by
+GCS buckets + Vertex AI Discovery Engine datastores.
+
+Routes use /knowledge-bases (plural) to match the existing frontend.
+Response shape matches the frontend's expected format:
+  kb_id, name, description, provider, status, documents, chunks,
+  index_id, endpoint, embedding_model, dimension, created_at,
+  last_synced, metadata
+"""
+import logging
+import os
+import json
+import asyncio
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.db.engine import get_db_session
+from backend.db.models import KnowledgeBaseModel, FileUploadModel
+from backend.config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+# ── Request / Response Models ─────────────────────────────────────────────────
+
+class CreateKnowledgeBaseRequest(BaseModel):
+    name: str
+    description: str = ""
+    chunk_size: int = Field(default=500, ge=100, le=2000)
+    overlap: int = Field(default=64, ge=0, le=500)
+    embedding_model: str = "text-embedding-004"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _kb_to_frontend_response(kb: KnowledgeBaseModel) -> dict:
+    """Convert a KnowledgeBaseModel to the response shape the frontend expects."""
+    meta = kb.metadata_json or {}
+    ds_info = meta.get("datastore_info", {})
+    ds_full_name = ds_info.get("datastore_full_name", "")
+
+    # Collect unique file types from uploaded files
+    file_types = list({f.file_type for f in (kb.files or []) if f.file_type})
+
+    return {
+        "kb_id": kb.id,
+        "name": kb.name,
+        "description": kb.description,
+        "provider": "vertex-ai",
+        "status": kb.status,
+        "documents": kb.file_count or 0,
+        "chunks": sum(f.chunk_count for f in (kb.files or [])),
+        "index_id": kb.datastore_id,
+        "endpoint": ds_full_name or f"projects/{kb.gcp_project_id}/locations/{kb.gcp_location}/collections/default_collection/dataStores/{kb.datastore_id}",
+        "embedding_model": "text-embedding-004",
+        "dimension": 768,
+        "created_at": kb.created_at.isoformat() + "Z" if kb.created_at else "",
+        "last_synced": kb.updated_at.isoformat() + "Z" if kb.updated_at else None,
+        "metadata": {
+            "avg_chunk_size": kb.chunk_size,
+            "overlap": kb.chunk_overlap,
+            "file_types": file_types,
+            "bucket_name": kb.bucket_name,
+            "parser_type": kb.parser_type,
+        },
+    }
+
+
+def _get_gcp_service():
+    """Lazily create the GCP Knowledge Base service."""
+    from backend.knowledge_base.gcp_service import GCPKnowledgeBaseService
+
+    sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    sa_info = None
+    if sa_path and os.path.exists(sa_path):
+        with open(sa_path) as f:
+            sa_info = json.load(f)
+
+    return GCPKnowledgeBaseService(
+        project_id=settings.gcp_project_id,
+        location="global",
+        service_account_info=sa_info,
+    )
+
+
+# ── Route Registration ────────────────────────────────────────────────────────
+
+def register_knowledge_base_routes(app: FastAPI):
+    """Register all knowledge base routes at /knowledge-bases."""
+
+    # ── List Knowledge Bases ──────────────────────────────────────────────
+
+    @app.get("/knowledge-bases", tags=["Knowledge Base"])
+    async def list_knowledge_bases(
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """List all knowledge bases."""
+        result = await session.execute(
+            select(KnowledgeBaseModel).order_by(KnowledgeBaseModel.created_at.desc())
+        )
+        kbs = result.scalars().all()
+        items = [_kb_to_frontend_response(kb) for kb in kbs]
+        return {"knowledge_bases": items, "count": len(items)}
+
+    # ── Get Knowledge Base ────────────────────────────────────────────────
+
+    @app.get("/knowledge-bases/{kb_id}", tags=["Knowledge Base"])
+    async def get_knowledge_base(
+        kb_id: str,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """Get a knowledge base by ID."""
+        result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = result.scalar_one_or_none()
+        if not kb:
+            raise HTTPException(404, "Knowledge base not found")
+        return _kb_to_frontend_response(kb)
+
+    # ── Create Knowledge Base ─────────────────────────────────────────────
+
+    @app.post("/knowledge-bases", tags=["Knowledge Base"])
+    async def create_knowledge_base(
+        req: CreateKnowledgeBaseRequest,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """
+        Create a new knowledge base:
+        1. Create GCS bucket
+        2. Create Vertex AI Discovery Engine datastore with layout parser
+        3. Grant Discovery Engine service agent access to bucket
+        4. Persist to DB
+        """
+        gcp_svc = _get_gcp_service()
+
+        # Discovery Engine layout-based chunking supports max 500
+        effective_chunk_size = min(req.chunk_size, 500)
+
+        # Create GCP resources (synchronous GCP calls in a thread)
+        try:
+            result = await asyncio.to_thread(
+                gcp_svc.create_knowledge_base,
+                name=req.name,
+                chunk_size=effective_chunk_size,
+                chunk_overlap=req.overlap,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create knowledge base GCP resources: {e}")
+            raise HTTPException(500, f"Failed to create GCP resources: {e}")
+
+        # Persist to DB
+        kb = KnowledgeBaseModel(
+            name=req.name,
+            description=req.description,
+            bucket_name=result["bucket"]["bucket_name"],
+            datastore_id=result["datastore"]["datastore_id"],
+            datastore_name=result["datastore"]["datastore_name"],
+            chunk_size=req.chunk_size,
+            chunk_overlap=req.overlap,
+            parser_type="layout",
+            gcp_project_id=settings.gcp_project_id,
+            gcp_location="global",
+            status="active",
+            metadata_json={
+                "resource_name": result["resource_name"],
+                "bucket_info": result["bucket"],
+                "datastore_info": result["datastore"],
+                "iam_info": result["iam"],
+            },
+        )
+        session.add(kb)
+        await session.flush()
+        await session.refresh(kb)
+
+        logger.info(f"Knowledge base created: {kb.id} ({kb.name})")
+
+        # Fire background full sync with Discovery Engine after creation
+        kb_id_created = kb.id
+        ds_id = kb.datastore_id
+        bkt = kb.bucket_name
+
+        async def _post_create_sync():
+            try:
+                await asyncio.to_thread(
+                    gcp_svc.import_documents,
+                    datastore_id=ds_id,
+                    gcs_uri=f"gs://{bkt}/*",
+                    mode="full",
+                )
+                logger.info(f"Post-creation full sync completed for KB {kb_id_created}")
+            except Exception as e:
+                logger.warning(f"Post-creation full sync failed for KB {kb_id_created} (expected if bucket is empty): {e}")
+
+        asyncio.create_task(_post_create_sync())
+
+        return _kb_to_frontend_response(kb)
+
+    # ── Delete Knowledge Base ─────────────────────────────────────────────
+
+    @app.delete("/knowledge-bases/{kb_id}", tags=["Knowledge Base"])
+    async def delete_knowledge_base(
+        kb_id: str,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """Delete a knowledge base and its GCP resources."""
+        result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = result.scalar_one_or_none()
+        if not kb:
+            raise HTTPException(404, "Knowledge base not found")
+
+        gcp_svc = _get_gcp_service()
+
+        # Delete GCP resources (best-effort)
+        errors = []
+        try:
+            await asyncio.to_thread(gcp_svc.delete_datastore, kb.datastore_id)
+        except Exception as e:
+            logger.error(f"Failed to delete datastore {kb.datastore_id}: {e}")
+            errors.append(f"datastore: {e}")
+
+        try:
+            await asyncio.to_thread(gcp_svc.delete_bucket, kb.bucket_name, True)
+        except Exception as e:
+            logger.error(f"Failed to delete bucket {kb.bucket_name}: {e}")
+            errors.append(f"bucket: {e}")
+
+        # Delete from DB
+        await session.delete(kb)
+
+        return {"success": True, "deleted": kb_id, "gcp_cleanup_errors": errors if errors else None}
+
+    # ── Upload File to Knowledge Base ─────────────────────────────────────
+
+    @app.post("/knowledge-bases/{kb_id}/upload", tags=["Knowledge Base"])
+    async def upload_file(
+        kb_id: str,
+        file: UploadFile = File(...),
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """Upload a file to a knowledge base's GCS bucket."""
+        result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = result.scalar_one_or_none()
+        if not kb:
+            raise HTTPException(404, "Knowledge base not found")
+
+        # Read file content
+        content = await file.read()
+        file_size = len(content)
+
+        # Upload to GCS
+        gcp_svc = _get_gcp_service()
+        try:
+            def _upload():
+                bucket = gcp_svc._storage_client.bucket(kb.bucket_name)
+                blob = bucket.blob(file.filename)
+                blob.upload_from_string(content, content_type=file.content_type)
+                return f"gs://{kb.bucket_name}/{file.filename}"
+
+            gcs_uri = await asyncio.to_thread(_upload)
+        except Exception as e:
+            logger.error(f"Failed to upload file to GCS: {e}")
+            raise HTTPException(500, f"Failed to upload file: {e}")
+
+        # Determine file type from extension
+        file_type = ""
+        if file.filename:
+            parts = file.filename.rsplit(".", 1)
+            if len(parts) > 1:
+                file_type = parts[1].lower()
+
+        # Record in DB
+        file_record = FileUploadModel(
+            knowledge_base_id=kb_id,
+            file_name=file.filename or "unknown",
+            file_type=file_type,
+            file_size_bytes=file_size,
+            content_type=file.content_type or "application/octet-stream",
+            gcs_uri=gcs_uri,
+            status="syncing",
+        )
+        session.add(file_record)
+
+        # Update KB counts
+        kb.file_count = (kb.file_count or 0) + 1
+        kb.total_size_bytes = (kb.total_size_bytes or 0) + file_size
+        kb.updated_at = datetime.utcnow()
+
+        await session.flush()
+        await session.refresh(file_record)
+
+        file_id = file_record.id
+        datastore_id = kb.datastore_id
+        bucket_name = kb.bucket_name
+
+        # Fire background incremental sync with Discovery Engine
+        async def _background_sync():
+            from backend.db.engine import get_session_factory
+            try:
+                import_result = await asyncio.to_thread(
+                    gcp_svc.import_documents,
+                    datastore_id=datastore_id,
+                    gcs_uri=f"gs://{bucket_name}/*",
+                )
+                new_status = "indexed"
+                error_msg = ""
+                if import_result.get("error_samples"):
+                    error_msg = "; ".join(
+                        e.get("message", "") for e in import_result["error_samples"]
+                    )
+                    if error_msg:
+                        new_status = "failed"
+                logger.info(f"Background sync completed for file {file_id}: {new_status}")
+            except Exception as e:
+                logger.error(f"Background sync failed for file {file_id}: {e}")
+                new_status = "failed"
+                error_msg = str(e)
+
+            # Update file status in a fresh DB session
+            try:
+                factory = get_session_factory()
+                async with factory() as bg_session:
+                    async with bg_session.begin():
+                        res = await bg_session.execute(
+                            select(FileUploadModel).where(FileUploadModel.id == file_id)
+                        )
+                        f = res.scalar_one_or_none()
+                        if f:
+                            f.status = new_status
+                            f.error_message = error_msg
+                        # Also update KB status
+                        kb_res = await bg_session.execute(
+                            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+                        )
+                        kb_obj = kb_res.scalar_one_or_none()
+                        if kb_obj:
+                            kb_obj.updated_at = datetime.utcnow()
+            except Exception as db_err:
+                logger.error(f"Failed to update file status after sync: {db_err}")
+
+        asyncio.create_task(_background_sync())
+
+        return {
+            "success": True,
+            "documents_added": 1,
+            "chunks_created": 0,
+            "total_documents": kb.file_count,
+            "total_chunks": sum(f.chunk_count for f in (kb.files or [])),
+            "file_id": file_id,
+            "file_name": file_record.file_name,
+            "gcs_uri": file_record.gcs_uri,
+            "status": "syncing",
+        }
+
+    # ── List Files in Knowledge Base ──────────────────────────────────────
+
+    @app.get("/knowledge-bases/{kb_id}/files", tags=["Knowledge Base"])
+    async def list_files(
+        kb_id: str,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """List all files in a knowledge base."""
+        result = await session.execute(
+            select(FileUploadModel)
+            .where(FileUploadModel.knowledge_base_id == kb_id)
+            .order_by(FileUploadModel.created_at.desc())
+        )
+        files = result.scalars().all()
+        return [
+            {
+                "id": f.id,
+                "file_name": f.file_name,
+                "file_type": f.file_type,
+                "file_size_bytes": f.file_size_bytes,
+                "content_type": f.content_type,
+                "gcs_uri": f.gcs_uri,
+                "status": f.status,
+                "error_message": f.error_message,
+                "chunk_count": f.chunk_count,
+                "uploaded_by": f.uploaded_by,
+                "created_at": f.created_at.isoformat() if f.created_at else "",
+            }
+            for f in files
+        ]
+
+    # ── Trigger Indexing ──────────────────────────────────────────────────
+
+    @app.post("/knowledge-bases/{kb_id}/index", tags=["Knowledge Base"])
+    async def trigger_indexing(
+        kb_id: str,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """
+        Trigger a full import/indexing of all documents in the knowledge base's
+        GCS bucket into the Vertex AI Discovery Engine datastore.
+        """
+        result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = result.scalar_one_or_none()
+        if not kb:
+            raise HTTPException(404, "Knowledge base not found")
+
+        gcp_svc = _get_gcp_service()
+        gcs_uri = f"gs://{kb.bucket_name}/*"
+
+        try:
+            import_result = await asyncio.to_thread(
+                gcp_svc.import_documents,
+                datastore_id=kb.datastore_id,
+                gcs_uri=gcs_uri,
+                mode="full",
+            )
+        except Exception as e:
+            logger.error(f"Failed to trigger indexing: {e}")
+            raise HTTPException(500, f"Failed to trigger indexing: {e}")
+
+        # Update file statuses to "indexed"
+        file_result = await session.execute(
+            select(FileUploadModel)
+            .where(FileUploadModel.knowledge_base_id == kb_id)
+            .where(FileUploadModel.status == "uploaded")
+        )
+        for f in file_result.scalars().all():
+            f.status = "indexed"
+
+        kb.status = "indexed"
+        kb.updated_at = datetime.utcnow()
+
+        return {
+            "knowledge_base_id": kb_id,
+            "datastore_id": kb.datastore_id,
+            "gcs_uri": gcs_uri,
+            "import_result": import_result,
+        }
+
+    # ── Test Knowledge Base (search) ──────────────────────────────────────
+
+    @app.post("/knowledge-bases/{kb_id}/test", tags=["Knowledge Base"])
+    async def test_knowledge_base(
+        kb_id: str,
+        req: Request,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """Test a knowledge base with a search query."""
+        result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = result.scalar_one_or_none()
+        if not kb:
+            raise HTTPException(404, "Knowledge base not found")
+
+        body = await req.json()
+        query = body.get("query", "")
+
+        # TODO: Implement actual Discovery Engine search
+        return {
+            "query": query,
+            "results": [],
+            "kb_id": kb_id,
+            "latency_ms": 0,
+            "message": "Search not yet implemented — use GCP console to test Discovery Engine queries.",
+        }
+
+    # ── Delete File ───────────────────────────────────────────────────────
+
+    @app.delete("/knowledge-bases/{kb_id}/files/{file_id}", tags=["Knowledge Base"])
+    async def delete_file(
+        kb_id: str,
+        file_id: str,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """Delete a file from the knowledge base (GCS + DB)."""
+        result = await session.execute(
+            select(FileUploadModel)
+            .where(FileUploadModel.id == file_id)
+            .where(FileUploadModel.knowledge_base_id == kb_id)
+        )
+        file_record = result.scalar_one_or_none()
+        if not file_record:
+            raise HTTPException(404, f"File '{file_id}' not found in knowledge base '{kb_id}'")
+
+        # Delete from GCS
+        gcp_svc = _get_gcp_service()
+        try:
+            def _delete():
+                bucket = gcp_svc._storage_client.bucket(
+                    file_record.gcs_uri.replace("gs://", "").split("/")[0]
+                )
+                blob_name = "/".join(file_record.gcs_uri.replace("gs://", "").split("/")[1:])
+                blob = bucket.blob(blob_name)
+                blob.delete()
+
+            await asyncio.to_thread(_delete)
+        except Exception as e:
+            logger.warning(f"Failed to delete file from GCS (continuing): {e}")
+
+        # Update KB counts
+        kb_result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = kb_result.scalar_one_or_none()
+        ds_id = kb.datastore_id if kb else None
+        bkt = kb.bucket_name if kb else None
+        if kb:
+            kb.file_count = max(0, (kb.file_count or 0) - 1)
+            kb.total_size_bytes = max(0, (kb.total_size_bytes or 0) - file_record.file_size_bytes)
+            kb.updated_at = datetime.utcnow()
+
+        await session.delete(file_record)
+
+        # Fire background full sync so Discovery Engine removes the deleted document
+        if ds_id and bkt:
+            async def _post_delete_sync():
+                try:
+                    await asyncio.to_thread(
+                        gcp_svc.import_documents,
+                        datastore_id=ds_id,
+                        gcs_uri=f"gs://{bkt}/*",
+                        mode="full",
+                    )
+                    logger.info(f"Post-delete full sync completed for KB {kb_id}")
+                except Exception as e:
+                    logger.warning(f"Post-delete full sync failed for KB {kb_id}: {e}")
+
+            asyncio.create_task(_post_delete_sync())
+
+        return {"deleted": file_id, "file_name": file_record.file_name}

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generator: Adobe Illustrator 24.2.3, SVG Export Plug-In . SVG Version: 6.00 Build 0)  -->
+<svg version="1.1" id="cursor-drag" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px"
+	 y="0px" viewBox="0 0 32 32" style="enable-background:new 0 0 32 32;" xml:space="preserve">
+<style type="text/css">
+	.st0{fill-rule:evenodd;clip-rule:evenodd;fill:#FFFFFF;stroke:#000000;stroke-width:2;stroke-miterlimit:10;}
+</style>
+<path d="M29.883,15.742l-4.401-3.674C25.285,11.904,25,12.056,25,12.326V15h-8V7h2.674c0.27,0,0.422-0.285,0.258-0.483l-3.674-4.401
+	c-0.13-0.156-0.385-0.156-0.515,0l-3.674,4.401C11.904,6.715,12.056,7,12.326,7H15v8H7v-2.674c0-0.27-0.285-0.422-0.483-0.258
+	l-4.401,3.674c-0.156,0.13-0.156,0.385,0,0.515l4.401,3.674C6.715,20.096,7,19.944,7,19.674V17h8v8h-2.674
+	c-0.27,0-0.422,0.285-0.258,0.483l3.674,4.401c0.13,0.156,0.385,0.156,0.515,0l3.674-4.401C20.096,25.285,19.944,25,19.674,25H17v-8
+	h8v2.674c0,0.27,0.285,0.422,0.483,0.258l4.401-3.674C30.039,16.127,30.039,15.872,29.883,15.742z"/>
+</svg>

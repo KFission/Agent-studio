@@ -1,0 +1,35 @@
+# JAI Agent OS — Backend Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jai-backend-config
+  namespace: jai-agent-os
+  labels:
+    app: jai-backend
+data:
+  # Server
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+  UVICORN_WORKERS: "4"
+
+  # Redis (for rate limiting, caching, session store)
+  REDIS_URL: "redis://jai-redis:6379/0"
+
+  # Keycloak IDP
+  KEYCLOAK_URL: "https://keycloak.example.com"
+  KEYCLOAK_REALM: "jai-agent-os"
+  KEYCLOAK_CLIENT_ID: "jai-backend"
+
+  # LangSmith Observability
+  LANGCHAIN_TRACING_V2: "true"
+  LANGCHAIN_PROJECT: "jai-agent-os-prod"
+
+  # Gateway rate limits (per tenant per minute)
+  GATEWAY_RATE_LIMIT_FREE: "60"
+  GATEWAY_RATE_LIMIT_STARTER: "300"
+  GATEWAY_RATE_LIMIT_PROFESSIONAL: "1000"
+  GATEWAY_RATE_LIMIT_ENTERPRISE: "5000"
+
+  # Multi-tenancy defaults
+  DEFAULT_TENANT_TIER: "free"
+  MAX_TENANTS: "1000"

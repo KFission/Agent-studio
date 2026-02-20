@@ -1,0 +1,37 @@
+# === Python / Backend ===
+.venv/
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+tests/
+alembic/
+alembic.ini
+
+# === Node / Frontend ===
+node_modules
+.next
+frontend/node_modules
+frontend/.next
+
+# === Git / IDE ===
+.git
+.gitignore
+.DS_Store
+*.md
+
+# === Docker (avoid recursive context) ===
+Dockerfile.*
+docker-compose*.yml
+
+# === Config / Secrets ===
+.env
+.env.*
+!.env.example
+
+# === Non-runtime assets ===
+k8s/
+docs/
+resources/
+scripts/

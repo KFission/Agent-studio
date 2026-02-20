@@ -1,0 +1,169 @@
+# JAI Agent OS — GKE Ingress (Google Cloud Load Balancer)
+# Routes /api/* → backend, /* → frontend
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jai-ingress
+  namespace: jai-agent-os
+  labels:
+    app: jai-agent-os
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "jai-agent-os-ip"
+    networking.gke.io/managed-certificates: "jai-tls-cert"
+    # Cloud Armor security policy (DDoS, WAF)
+    networking.gke.io/v1beta1.FrontendConfig: "jai-frontend-config"
+spec:
+  rules:
+    - host: "agent-os.example.com"
+      http:
+        paths:
+          # Backend API routes
+          - path: /v1/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /agents/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /models/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /tenants/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /gateway/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /llm-logs/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /inbox/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /threads/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /info
+            pathType: Exact
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /eval/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /rag/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /tools/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /prompts/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /settings/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /users/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /roles/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          - path: /orchestrator/*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-backend
+                port:
+                  number: 8080
+          # Frontend (catch-all)
+          - path: /*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jai-frontend
+                port:
+                  number: 3000
+---
+# Managed TLS certificate
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: jai-tls-cert
+  namespace: jai-agent-os
+spec:
+  domains:
+    - agent-os.example.com
+---
+# Frontend config for HTTPS redirect
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: jai-frontend-config
+  namespace: jai-agent-os
+spec:
+  redirectToHttps:
+    enabled: true
+    responseCodeName: MOVED_PERMANENTLY_DEFAULT

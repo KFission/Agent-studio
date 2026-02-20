@@ -1,0 +1,100 @@
+# JAI Agent OS — Backend Deployment
+# Designed for GKE: 1000 LLM req/sec target throughput
+# Each pod runs 4 uvicorn workers; HPA scales pods 3→50
+# At 50 pods × 4 workers = 200 concurrent workers → ~1200 req/sec capacity
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jai-backend
+  namespace: jai-agent-os
+  labels:
+    app: jai-backend
+    tier: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jai-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: jai-backend
+        tier: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: jai-backend-sa
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: backend
+          image: gcr.io/PROJECT_ID/jai-agent-os-backend:latest
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+              name: http
+          envFrom:
+            - secretRef:
+                name: jai-api-keys
+            - configMapRef:
+                name: jai-backend-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /info
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /info
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /info
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 10
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: jai-backend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jai-backend
+  namespace: jai-agent-os
+  labels:
+    app: jai-backend
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: jai-backend
