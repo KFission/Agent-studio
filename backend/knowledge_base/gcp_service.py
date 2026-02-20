@@ -346,6 +346,20 @@ class GCPKnowledgeBaseService:
 
     # ── Search ────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _struct_to_dict(struct) -> dict:
+        """
+        Convert a google.protobuf.Struct to a plain Python dict.
+
+        dict(struct) gives you Value wrapper objects, not plain types.
+        MessageToDict is the correct way to get real Python values.
+        """
+        from google.protobuf.json_format import MessageToDict
+        try:
+            return MessageToDict(struct)
+        except Exception:
+            return {}
+
     def search_documents(
         self,
         datastore_id: str,
@@ -396,46 +410,47 @@ class GCPKnowledgeBaseService:
         results = []
         for result in response.results:
             doc = result.document
-            derived = {}
-            if hasattr(doc, "derived_struct_data") and doc.derived_struct_data:
-                derived = dict(doc.derived_struct_data)
 
-            # Document name / URI
+            # Convert protobuf Struct → plain Python dict (dict() gives Value wrappers)
+            derived = self._struct_to_dict(doc.derived_struct_data) if (
+                hasattr(doc, "derived_struct_data") and doc.derived_struct_data
+            ) else {}
+
+            # Document name: prefer the GCS URI link, fall back to doc id
             link = derived.get("link", "")
-            if hasattr(link, "string_value"):
-                link = link.string_value
             doc_name = str(link).split("/")[-1] if link else (doc.id or "Unknown")
 
-            # Page identifier
-            page_val = derived.get("pageIdentifier", "1")
-            if hasattr(page_val, "string_value"):
-                page_val = page_val.string_value
+            # Page identifier (Discovery Engine stores it as a string)
+            # Field name may appear as "pageIdentifier" (MessageToDict camelCase)
+            page_val = derived.get("pageIdentifier", derived.get("page_identifier", "1"))
             try:
                 page = int(str(page_val))
             except (ValueError, TypeError):
                 page = 1
 
-            # Extractive segment → text + score
+            # Extractive segments carry the actual text + relevance score.
+            # MessageToDict uses camelCase for proto fields, but derived_struct_data
+            # keys are freeform strings set by the service — try both conventions.
             text = ""
             score = 0.0
-            segments = derived.get("extractive_segments", [])
-            if segments:
+            segments = derived.get("extractiveSegments", derived.get("extractive_segments", []))
+            if segments and isinstance(segments, list):
                 seg = segments[0]
-                if hasattr(seg, "fields"):
-                    fields = dict(seg.fields)
-                    text = fields.get("content", seg).string_value if hasattr(fields.get("content", ""), "string_value") else str(fields.get("content", ""))
-                    score_val = fields.get("relevanceScore", None)
-                    if score_val is not None and hasattr(score_val, "number_value"):
-                        score = score_val.number_value
+                if isinstance(seg, dict):
+                    text = seg.get("content", "")
+                    raw_score = seg.get("relevanceScore", seg.get("relevance_score", 0.0))
+                    try:
+                        score = float(raw_score)
+                    except (TypeError, ValueError):
+                        score = 0.0
 
-            # Fallback to snippets
+            # Fallback: use snippet text when no extractive segment was returned
             if not text:
                 snippets = derived.get("snippets", [])
-                if snippets:
+                if snippets and isinstance(snippets, list):
                     snip = snippets[0]
-                    if hasattr(snip, "fields"):
-                        fields = dict(snip.fields)
-                        text = fields.get("snippet", snip).string_value if hasattr(fields.get("snippet", ""), "string_value") else str(fields.get("snippet", ""))
+                    if isinstance(snip, dict):
+                        text = snip.get("snippet", "")
 
             results.append({
                 "document": doc_name,
@@ -445,6 +460,44 @@ class GCPKnowledgeBaseService:
             })
 
         return results
+
+    def get_indexed_content_samples(
+        self,
+        datastore_id: str,
+        num_chunks: int = 10,
+    ) -> list:
+        """
+        Retrieve a diverse sample of document chunks via broad Discovery Engine
+        searches. Works for all indexed file types including PDFs and DOCX —
+        the text was already extracted by Vertex AI's layout parser during indexing.
+        Useful as document content input for LLM-based test data generation.
+        """
+        broad_queries = [
+            "overview introduction summary",
+            "key concepts main topics",
+            "process steps procedure details",
+            "specifications requirements information",
+        ]
+
+        seen_texts: set = set()
+        chunks: list = []
+
+        for query in broad_queries:
+            try:
+                results = self.search_documents(datastore_id, query, page_size=5)
+                for r in results:
+                    txt = (r.get("text") or "").strip()
+                    if txt and txt not in seen_texts:
+                        seen_texts.add(txt)
+                        chunks.append(r)
+                        if len(chunks) >= num_chunks:
+                            break
+            except Exception as e:
+                logger.warning(f"Broad search failed for query '{query}': {e}")
+            if len(chunks) >= num_chunks:
+                break
+
+        return chunks
 
     # ── Document Content Sampling (for test data generation) ──────────────────
 

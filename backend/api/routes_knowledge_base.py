@@ -575,29 +575,61 @@ def register_knowledge_base_routes(app: FastAPI, model_library=None, provider_fa
         num_questions: int = int(body.get("num_questions", 5))
         prompt_template: str = body.get("prompt_template", "")
 
-        # Fetch document content samples from GCS
         gcp_svc = await _get_gcp_service(session)
+
+        # Primary: use indexed chunks from Discovery Engine — works for ALL file types
+        # (PDFs, DOCX, etc.) because Vertex AI already extracted the text during indexing.
+        chunks = []
         try:
-            samples = await asyncio.to_thread(
-                gcp_svc.get_document_content_samples,
-                bucket_name=kb.bucket_name,
-                max_files=3,
-                max_bytes_per_file=8000,
+            chunks = await asyncio.to_thread(
+                gcp_svc.get_indexed_content_samples,
+                datastore_id=kb.datastore_id,
+                num_chunks=10,
             )
         except Exception as e:
-            logger.error(f"Failed to read GCS samples for KB {kb_id}: {e}")
-            raise HTTPException(500, f"Failed to read documents: {e}")
+            logger.warning(f"Could not get indexed content for KB {kb_id}: {e}")
 
-        if not samples:
-            raise HTTPException(422, "No documents found in this knowledge base. Upload files first.")
+        if chunks:
+            doc_content_parts = [
+                f"[Document: {c['document']}, Page: {c['page']}]\n{c['text']}"
+                for c in chunks if c.get("text")
+            ]
+            document_content = "\n\n".join(doc_content_parts)
+            content_source = f"indexed ({len(chunks)} chunks)"
+        else:
+            # Fallback: read raw GCS text (works for .txt, .md, .json, .csv, .html only)
+            logger.info(f"No indexed chunks found for KB {kb_id}, falling back to raw GCS read")
+            try:
+                samples = await asyncio.to_thread(
+                    gcp_svc.get_document_content_samples,
+                    bucket_name=kb.bucket_name,
+                    max_files=3,
+                    max_bytes_per_file=8000,
+                )
+            except Exception as e:
+                logger.error(f"Failed to read GCS samples for KB {kb_id}: {e}")
+                raise HTTPException(500, f"Failed to read documents: {e}")
 
-        # Build document content string for the prompt
-        doc_content_parts = []
-        for s in samples:
-            header = f"--- {s['name']} ({s['extension'].upper() or 'file'}, {s['size_bytes']} bytes) ---"
-            body_text = s["content"] if s["content"] else "(binary file — use the filename as context)"
-            doc_content_parts.append(f"{header}\n{body_text}")
-        document_content = "\n\n".join(doc_content_parts)
+            if not samples:
+                raise HTTPException(
+                    422,
+                    "No documents found. Upload and index files before generating test data.",
+                )
+
+            doc_content_parts = []
+            for s in samples:
+                header = f"--- {s['name']} ({s['extension'].upper() or 'file'}, {s['size_bytes']} bytes) ---"
+                body_text = s["content"] or "(binary file — cannot extract text without indexing)"
+                doc_content_parts.append(f"{header}\n{body_text}")
+            document_content = "\n\n".join(doc_content_parts)
+            content_source = f"raw GCS ({len(samples)} files)"
+
+        if not document_content.strip():
+            raise HTTPException(
+                422,
+                "Documents are uploaded but not yet indexed. "
+                "Click 'Index All' and wait for indexing to complete, then try again.",
+            )
 
         # Build the final prompt
         if prompt_template:
@@ -656,7 +688,7 @@ def register_knowledge_base_routes(app: FastAPI, model_library=None, provider_fa
             "test_data": test_data,
             "kb_id": kb_id,
             "model_used": model_id,
-            "documents_sampled": len(samples),
+            "content_source": content_source,
         }
 
     # ── Delete File ───────────────────────────────────────────────────────
