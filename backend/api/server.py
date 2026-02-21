@@ -2752,7 +2752,7 @@ register_langgraph_routes(app, langgraph_client)
 # ══════════════════════════════════════════════════════════════════════════════
 
 from backend.api.routes_knowledge_base import register_knowledge_base_routes
-register_knowledge_base_routes(app)
+register_knowledge_base_routes(app, model_library, provider_factory, integration_manager)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

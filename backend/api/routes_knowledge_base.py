@@ -125,8 +125,30 @@ _bg_tasks: set = set()
 
 # ── Route Registration ────────────────────────────────────────────────────────
 
-def register_knowledge_base_routes(app: FastAPI):
+def register_knowledge_base_routes(app: FastAPI, model_library=None, provider_factory=None, integration_manager=None):
     """Register all knowledge base routes at /knowledge-bases."""
+
+    def _build_llm(model_id: str, temperature: float = 0.4, max_tokens: int = 4096):
+        """Create an LLM instance via the shared provider factory."""
+        if provider_factory is None:
+            raise HTTPException(500, "LLM provider not available")
+        extra_kwargs: dict = {}
+        credential_data = None
+        if model_library and integration_manager:
+            entry = model_library.get(model_id)
+            if entry:
+                intg_id = (entry.metadata or {}).get("integration_id")
+                if intg_id:
+                    intg = integration_manager.get(intg_id)
+                    if intg:
+                        if intg.auth_type == "api_key" and intg.api_key:
+                            extra_kwargs["google_api_key"] = intg.api_key
+                        elif intg.auth_type == "service_account" and intg.service_account_json:
+                            credential_data = intg.service_account_json
+        return provider_factory.create(
+            model_id, temperature=temperature, max_tokens=max_tokens,
+            credential_data=credential_data, **extra_kwargs,
+        )
 
     # ── List Knowledge Bases ──────────────────────────────────────────────
 
@@ -490,7 +512,9 @@ def register_knowledge_base_routes(app: FastAPI):
         req: Request,
         session: AsyncSession = Depends(get_db_session),
     ):
-        """Test a knowledge base with a search query."""
+        """Search a knowledge base using Vertex AI Discovery Engine."""
+        import time as _time
+
         result = await session.execute(
             select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
         )
@@ -499,15 +523,172 @@ def register_knowledge_base_routes(app: FastAPI):
             raise HTTPException(404, "Knowledge base not found")
 
         body = await req.json()
-        query = body.get("query", "")
+        query = body.get("query", "").strip()
+        top_k = int(body.get("top_k", 5))
 
-        # TODO: Implement actual Discovery Engine search
+        if not query:
+            raise HTTPException(400, "query is required")
+
+        gcp_svc = await _get_gcp_service(session)
+
+        start = _time.time()
+        try:
+            results = await asyncio.to_thread(
+                gcp_svc.search_documents,
+                datastore_id=kb.datastore_id,
+                query=query,
+                page_size=top_k,
+            )
+        except Exception as e:
+            logger.error(f"Discovery Engine search failed for KB {kb_id}: {e}")
+            raise HTTPException(500, f"Search failed: {e}")
+
+        latency_ms = round((_time.time() - start) * 1000)
         return {
             "query": query,
-            "results": [],
+            "results": results,
             "kb_id": kb_id,
-            "latency_ms": 0,
-            "message": "Search not yet implemented — use GCP console to test Discovery Engine queries.",
+            "latency_ms": latency_ms,
+        }
+
+    # ── Generate Test Data ────────────────────────────────────────────────
+
+    @app.post("/knowledge-bases/{kb_id}/generate-test-data", tags=["Knowledge Base"])
+    async def generate_test_data(
+        kb_id: str,
+        req: Request,
+        session: AsyncSession = Depends(get_db_session),
+    ):
+        """
+        Generate Q&A test pairs from the knowledge base documents using an LLM.
+        Body: { model_id, num_questions, prompt_template }
+        """
+        result = await session.execute(
+            select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == kb_id)
+        )
+        kb = result.scalar_one_or_none()
+        if not kb:
+            raise HTTPException(404, "Knowledge base not found")
+
+        body = await req.json()
+        model_id: str = body.get("model_id", "gemini-2.5-flash")
+        num_questions: int = int(body.get("num_questions", 5))
+        prompt_template: str = body.get("prompt_template", "")
+
+        gcp_svc = await _get_gcp_service(session)
+
+        # Primary: use indexed chunks from Discovery Engine — works for ALL file types
+        # (PDFs, DOCX, etc.) because Vertex AI already extracted the text during indexing.
+        chunks = []
+        try:
+            chunks = await asyncio.to_thread(
+                gcp_svc.get_indexed_content_samples,
+                datastore_id=kb.datastore_id,
+                num_chunks=10,
+            )
+        except Exception as e:
+            logger.warning(f"Could not get indexed content for KB {kb_id}: {e}")
+
+        if chunks:
+            doc_content_parts = [
+                f"[Document: {c['document']}, Page: {c['page']}]\n{c['text']}"
+                for c in chunks if c.get("text")
+            ]
+            document_content = "\n\n".join(doc_content_parts)
+            content_source = f"indexed ({len(chunks)} chunks)"
+        else:
+            # Fallback: read raw GCS text (works for .txt, .md, .json, .csv, .html only)
+            logger.info(f"No indexed chunks found for KB {kb_id}, falling back to raw GCS read")
+            try:
+                samples = await asyncio.to_thread(
+                    gcp_svc.get_document_content_samples,
+                    bucket_name=kb.bucket_name,
+                    max_files=3,
+                    max_bytes_per_file=8000,
+                )
+            except Exception as e:
+                logger.error(f"Failed to read GCS samples for KB {kb_id}: {e}")
+                raise HTTPException(500, f"Failed to read documents: {e}")
+
+            if not samples:
+                raise HTTPException(
+                    422,
+                    "No documents found. Upload and index files before generating test data.",
+                )
+
+            doc_content_parts = []
+            for s in samples:
+                header = f"--- {s['name']} ({s['extension'].upper() or 'file'}, {s['size_bytes']} bytes) ---"
+                body_text = s["content"] or "(binary file — cannot extract text without indexing)"
+                doc_content_parts.append(f"{header}\n{body_text}")
+            document_content = "\n\n".join(doc_content_parts)
+            content_source = f"raw GCS ({len(samples)} files)"
+
+        if not document_content.strip():
+            raise HTTPException(
+                422,
+                "Documents are uploaded but not yet indexed. "
+                "Click 'Index All' and wait for indexing to complete, then try again.",
+            )
+
+        # Build the final prompt
+        if prompt_template:
+            prompt = (
+                prompt_template
+                .replace("{document_content}", document_content)
+                .replace("{num_questions}", str(num_questions))
+            )
+        else:
+            prompt = (
+                f"You are a QA test case generator for a RAG knowledge base.\n\n"
+                f"## Document Content\n{document_content}\n\n"
+                f"## Instructions\n"
+                f"- Generate {num_questions} question-answer pairs\n"
+                f"- Cover different topics and question types\n"
+                f"- Each answer must be directly supported by the document content\n"
+                f"- Format as JSON array: "
+                f'[{{"question": "...", "expected_answer": "...", "category": "..."}}]\n\n'
+                f"Return ONLY the JSON array, no commentary."
+            )
+
+        try:
+            llm = _build_llm(model_id, temperature=0.4, max_tokens=4096)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"Failed to initialise LLM: {e}")
+
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: llm.invoke([{"role": "user", "content": prompt}])
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            logger.error(f"LLM call failed for generate-test-data KB {kb_id}: {e}")
+            raise HTTPException(500, f"LLM generation failed: {e}")
+
+        # Parse JSON from the LLM response
+        test_data = []
+        try:
+            # Strip markdown code fences if present
+            raw = content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```", 2)[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.rsplit("```", 1)[0].strip()
+            test_data = json.loads(raw)
+            if not isinstance(test_data, list):
+                test_data = []
+        except Exception:
+            logger.warning(f"Could not parse LLM JSON for test data, returning raw: {content[:200]}")
+            test_data = [{"question": "Parse error", "expected_answer": content, "category": "raw"}]
+
+        return {
+            "test_data": test_data,
+            "kb_id": kb_id,
+            "model_used": model_id,
+            "content_source": content_source,
         }
 
     # ── Delete File ───────────────────────────────────────────────────────

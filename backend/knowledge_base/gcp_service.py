@@ -344,6 +344,198 @@ class GCPKnowledgeBaseService:
             "error_samples": error_samples,
         }
 
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _struct_to_dict(struct) -> dict:
+        """
+        Convert a google.protobuf.Struct to a plain Python dict.
+
+        dict(struct) gives you Value wrapper objects, not plain types.
+        MessageToDict is the correct way to get real Python values.
+        """
+        from google.protobuf.json_format import MessageToDict
+        try:
+            return MessageToDict(struct)
+        except Exception:
+            return {}
+
+    def search_documents(
+        self,
+        datastore_id: str,
+        query: str,
+        page_size: int = 10,
+    ) -> list:
+        """
+        Search documents in the Vertex AI Discovery Engine datastore.
+
+        Returns a list of dicts with keys: document, page, score, text.
+        """
+        client_kwargs = {}
+        if self._credentials:
+            client_kwargs["credentials"] = self._credentials
+
+        search_client = discoveryengine.SearchServiceClient(**client_kwargs)
+
+        serving_config = (
+            f"projects/{self.project_id}/locations/{self.location}"
+            f"/collections/default_collection/dataStores/{datastore_id}"
+            f"/servingConfigs/default_config"
+        )
+
+        request = discoveryengine.SearchRequest(
+            serving_config=serving_config,
+            query=query,
+            page_size=page_size,
+            content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
+                extractive_content_spec=discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
+                    max_extractive_segment_count=1,
+                    return_extractive_segment_score=True,
+                ),
+                snippet_spec=discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
+                    return_snippet=True,
+                    max_snippet_count=2,
+                ),
+            ),
+            query_expansion_spec=discoveryengine.SearchRequest.QueryExpansionSpec(
+                condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO,
+            ),
+            spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
+                mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO,
+            ),
+        )
+
+        response = search_client.search(request=request)
+
+        results = []
+        for result in response.results:
+            doc = result.document
+
+            # Convert protobuf Struct → plain Python dict (dict() gives Value wrappers)
+            derived = self._struct_to_dict(doc.derived_struct_data) if (
+                hasattr(doc, "derived_struct_data") and doc.derived_struct_data
+            ) else {}
+
+            # Document name: prefer the GCS URI link, fall back to doc id
+            link = derived.get("link", "")
+            doc_name = str(link).split("/")[-1] if link else (doc.id or "Unknown")
+
+            # Page identifier (Discovery Engine stores it as a string)
+            # Field name may appear as "pageIdentifier" (MessageToDict camelCase)
+            page_val = derived.get("pageIdentifier", derived.get("page_identifier", "1"))
+            try:
+                page = int(str(page_val))
+            except (ValueError, TypeError):
+                page = 1
+
+            # Extractive segments carry the actual text + relevance score.
+            # MessageToDict uses camelCase for proto fields, but derived_struct_data
+            # keys are freeform strings set by the service — try both conventions.
+            text = ""
+            score = 0.0
+            segments = derived.get("extractiveSegments", derived.get("extractive_segments", []))
+            if segments and isinstance(segments, list):
+                seg = segments[0]
+                if isinstance(seg, dict):
+                    text = seg.get("content", "")
+                    raw_score = seg.get("relevanceScore", seg.get("relevance_score", 0.0))
+                    try:
+                        score = float(raw_score)
+                    except (TypeError, ValueError):
+                        score = 0.0
+
+            # Fallback: use snippet text when no extractive segment was returned
+            if not text:
+                snippets = derived.get("snippets", [])
+                if snippets and isinstance(snippets, list):
+                    snip = snippets[0]
+                    if isinstance(snip, dict):
+                        text = snip.get("snippet", "")
+
+            results.append({
+                "document": doc_name,
+                "page": page,
+                "score": round(float(score), 4),
+                "text": text,
+            })
+
+        return results
+
+    def get_indexed_content_samples(
+        self,
+        datastore_id: str,
+        num_chunks: int = 10,
+    ) -> list:
+        """
+        Retrieve a diverse sample of document chunks via broad Discovery Engine
+        searches. Works for all indexed file types including PDFs and DOCX —
+        the text was already extracted by Vertex AI's layout parser during indexing.
+        Useful as document content input for LLM-based test data generation.
+        """
+        broad_queries = [
+            "overview introduction summary",
+            "key concepts main topics",
+            "process steps procedure details",
+            "specifications requirements information",
+        ]
+
+        seen_texts: set = set()
+        chunks: list = []
+
+        for query in broad_queries:
+            try:
+                results = self.search_documents(datastore_id, query, page_size=5)
+                for r in results:
+                    txt = (r.get("text") or "").strip()
+                    if txt and txt not in seen_texts:
+                        seen_texts.add(txt)
+                        chunks.append(r)
+                        if len(chunks) >= num_chunks:
+                            break
+            except Exception as e:
+                logger.warning(f"Broad search failed for query '{query}': {e}")
+            if len(chunks) >= num_chunks:
+                break
+
+        return chunks
+
+    # ── Document Content Sampling (for test data generation) ──────────────────
+
+    def get_document_content_samples(
+        self,
+        bucket_name: str,
+        max_files: int = 3,
+        max_bytes_per_file: int = 8000,
+    ) -> list:
+        """
+        Download a text sample from each document in the GCS bucket.
+        Binary formats (PDF, DOCX, PPTX, XLSX) are listed by name only —
+        the LLM uses the filename as a hint about content.
+        """
+        TEXT_EXTENSIONS = {".txt", ".md", ".html", ".csv", ".json"}
+
+        bucket = self._storage_client.bucket(bucket_name)
+        blobs = list(bucket.list_blobs())
+
+        samples = []
+        for blob in blobs[:max_files]:
+            ext = ("." + blob.name.rsplit(".", 1)[-1].lower()) if "." in blob.name else ""
+            content = ""
+            if ext in TEXT_EXTENSIONS:
+                try:
+                    raw = blob.download_as_bytes(end=max_bytes_per_file)
+                    content = raw.decode("utf-8", errors="replace")
+                except Exception as e:
+                    logger.warning(f"Could not read {blob.name}: {e}")
+            samples.append({
+                "name": blob.name,
+                "extension": ext.lstrip("."),
+                "size_bytes": blob.size or 0,
+                "content": content,
+            })
+
+        return samples
+
     # ── Full Knowledge Base Creation ──────────────────────────────────────────
 
     def create_knowledge_base(

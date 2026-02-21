@@ -150,12 +150,20 @@ export default function KnowledgeBasesPage() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
-  const load = useCallback(() => {
-    setLoading(true);
+  const load = useCallback((silent = false) => {
+    if (!silent) setLoading(true);
     apiFetch(`${API}/knowledge-bases`).then(r => r.json()).then(d => {
-      setKbs(d.knowledge_bases || []);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+      const kbList = d.knowledge_bases || [];
+      setKbs(kbList);
+      // Keep selected KB data in sync during silent background refreshes
+      if (silent) {
+        setSelected(prev => {
+          if (!prev) return prev;
+          return kbList.find(kb => kb.kb_id === prev.kb_id) || prev;
+        });
+      }
+      if (!silent) setLoading(false);
+    }).catch(() => { if (!silent) setLoading(false); });
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -182,7 +190,7 @@ export default function KnowledgeBasesPage() {
     if (!hasSyncing || !selected?.kb_id) return;
     const interval = setInterval(() => {
       loadFiles(selected.kb_id);
-      load(); // also refresh KB list to update doc counts
+      load(true); // silent — no loading spinner, no scroll-to-top
     }, 5000);
     return () => clearInterval(interval);
   }, [uploadedFiles, selected?.kb_id, loadFiles, load]);
@@ -272,15 +280,33 @@ export default function KnowledgeBasesPage() {
   const runTest = async (kbId) => {
     if (!testQuery.trim()) return;
     setActionLoading("test");
-    const r = await apiFetch(`${API}/knowledge-bases/${kbId}/test`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: testQuery, top_k: topK }) });
-    setTestResults(await r.json());
+    try {
+      const r = await apiFetch(`${API}/knowledge-bases/${kbId}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: testQuery, top_k: topK }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      setTestResults(await r.json());
+    } catch (e) { console.error("Search failed:", e); }
     setActionLoading("");
   };
 
   const generateTestData = async (kbId) => {
     setActionLoading("generate");
-    const r = await apiFetch(`${API}/knowledge-bases/${kbId}/generate-test-data`, { method: "POST" });
-    setTestData(await r.json());
+    try {
+      const r = await apiFetch(`${API}/knowledge-bases/${kbId}/generate-test-data`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_id: evalModel,
+          num_questions: 5,
+          prompt_template: prompts.testCaseGeneration,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      setTestData(await r.json());
+    } catch (e) { console.error("Generate test data failed:", e); }
     setActionLoading("");
   };
 
